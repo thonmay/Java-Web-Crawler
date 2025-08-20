@@ -1,112 +1,99 @@
 package com.thonmay.webcrawler;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.util.*;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
-/**
- * A simple, single-threaded web crawler.
- * This class will crawl the web starting from a "seed" URL,
- * keeping track of visited URLs and discovering new ones.
- */
 public class Crawler {
-    private final Queue<String> frontier;
 
-    private final Set<String> visited;
-    
-    private static final String URL_REGEX = "href=\"(.*?)\""; // Looks for href attributes on <a> tags.
-    private final Pattern urlPattern;
+    private final int maxPagesToCrawl;
+    private final Set<URI> visitedUris;
+    private final AtomicInteger activeTaskCount = new AtomicInteger(0);
+    private final WordIndexer indexer;
 
-    public Crawler() {
-        this.frontier = new LinkedList<>();
-        this.visited = new HashSet<>();
-        this.urlPattern = Pattern.compile(URL_REGEX, Pattern.CASE_INSENSITIVE);
+    public Crawler(int maxPagesToCrawl) {
+        this.maxPagesToCrawl = maxPagesToCrawl;
+        this.visitedUris = ConcurrentHashMap.newKeySet();
+        this.indexer = new WordIndexer();
     }
 
-    /**
-     * The main crawling logic.
-     * @param seedUrl The starting URL for the crawl.
-     * @param maxPages The maximum number of pages to crawl.
-     */
-    public void startCrawling(String seedUrl, int maxPages) {
-        frontier.add(seedUrl);
+    public void crawl(String seedUrl) {
+        ExecutorService executor = Executors.newFixedThreadPool(10);
 
-        // Loop until the lrontier is empty or visited the max number of pages.
-        while (!frontier.isEmpty() && visited.size() < maxPages) {
-            String currentUrl = frontier.poll(); 
+        try {
+            scheduleFetch(new URI(seedUrl), executor);
 
-            if (currentUrl == null || visited.contains(currentUrl)) {
-                continue; 
-            }
-
-            visited.add(currentUrl);
-            System.out.println("Crawling: " + currentUrl);
-
-            try {
-                URL url = new URL(currentUrl);
-                String htmlContent = downloadPage(url);
-                if (htmlContent != null) {
-                    processPage(url, htmlContent);
+            while (activeTaskCount.get() > 0) {
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    System.err.println("Main thread interrupted.");
+                    break;
                 }
-            } catch (MalformedURLException e) {
-                System.err.println("Invalid URL format: " + currentUrl);
-            } catch (IOException e) {
-                System.err.println("Error downloading page: " + currentUrl + " - " + e.getMessage());
             }
-        }
-        System.out.println("\nCrawling finished. Visited " + visited.size() + " pages.");
-    }
 
-    /**
-     * Downloads the HTML content of a given URL.
-     * @param url The URL of the page to download.
-     * @return The HTML content as a String, or null if an error occurs.
-     * @throws IOException if a network error occurs.
-     */
-    private String downloadPage(URL url) throws IOException {
-        
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(url.openStream()))) {
-            StringBuilder content = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                content.append(line);
-            }
-            return content.toString();
+        } catch (URISyntaxException e) {
+            System.err.println("Invalid seed URL: " + seedUrl);
+        } finally {
+            shutdownAndAwaitTermination(executor); 
+            System.out.println("\nCrawl finished. Visited " + visitedUris.size() + " unique pages.");
+            indexer.printIndexResults();
         }
     }
 
+    private void scheduleFetch(URI uri, ExecutorService executor) {
+        if (visitedUris.size() >= maxPagesToCrawl || !visitedUris.add(uri)) {
+            return;
+        }
+
+        activeTaskCount.incrementAndGet();
+        System.out.println("Scheduling (" + activeTaskCount.get() + " active): " + uri);
+
+        CompletableFuture.supplyAsync(() -> PageFetcher.fetch(uri), executor)
+                .thenAcceptAsync(fetchResultOpt -> {
+                    fetchResultOpt.ifPresent(result -> {
+                        indexer.indexPage(result.fetchedUri(), result.htmlContent());
+                        result.containedLinks().forEach(link -> scheduleFetch(link, executor));
+                    });
+                }, executor)
+                .whenComplete((res, ex) -> {
+                    if (ex != null) {
+                        System.err.println("Error processing " + uri + ": " + ex.getMessage());
+                    }
+                    activeTaskCount.decrementAndGet();
+                });
+    }
+
     /**
-     * Parses the HTML content to find new links and adds them to the Frontier.
-     * @param baseUrl The URL of the page being processed, used to resolve relative links.
-     * @param htmlContent The HTML content of the page.
+     * Initiates an orderly shutdown in which previously submitted tasks are
+     * executed, but no new tasks will be accepted. Waits for existing tasks to
+     * terminate and then returns. If the specified waiting time elapses before
+     * termination, the pool is forcibly terminated.
+     *
+     * @param pool The executor service to be shut down.
      */
-    private void processPage(URL baseUrl, String htmlContent) {
-        Matcher matcher = urlPattern.matcher(htmlContent);
-        
-        while (matcher.find()) {
-            String link = matcher.group(1).trim(); 
-
-            try {
-                URL absoluteUrl = new URL(baseUrl, link);
-                String formattedUrl = absoluteUrl.toExternalForm();
-
-                if (!visited.contains(formattedUrl)) {
-                    frontier.add(formattedUrl);
-                }
-            } catch (MalformedURLException e) {
-                
+    private void shutdownAndAwaitTermination(ExecutorService pool) {
+        pool.shutdown(); 
+        try {
+            if (!pool.awaitTermination(60, TimeUnit.SECONDS)) {
+                pool.shutdownNow();
+                if (!pool.awaitTermination(60, TimeUnit.SECONDS))
+                    System.err.println("Pool did not terminate");
             }
+        } catch (InterruptedException ie) {
+            pool.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 
     public static void main(String[] args) {
-        
-        Crawler crawler = new Crawler();
-        crawler.startCrawling("https://thonmay.netlify.app/", 50);
+        Crawler crawler = new Crawler(100);
+        crawler.crawl("https://thonmay.netlify.app/");
     }
 }

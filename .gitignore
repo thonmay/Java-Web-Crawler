@@ -5,6 +5,7 @@
 *.log
 
 out/
+.vscode
 
 # BlueJ files
 *.ctxt
