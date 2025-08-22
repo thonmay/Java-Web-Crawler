@@ -20,4 +20,3 @@ A multithreaded web crawler in Java that concurrently fetches pages and builds a
 *   JDK 17 or newer
 *   Apache Maven
 
-```
